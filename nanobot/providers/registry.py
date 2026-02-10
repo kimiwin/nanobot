@@ -284,6 +284,25 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         strip_model_prefix=True,          # Strip "openai/" before sending to endpoint
         model_overrides=(),
     ),
+    # MiniMax: OpenAI-compatible endpoint
+    ProviderSpec(
+        name="minimax",
+        keywords=("minimax",),
+        env_key="OPENAI_API_KEY",
+        display_name="MiniMax",
+        litellm_prefix="openai",
+        skip_prefixes=("openai/",),
+        env_extras=(
+            ("OPENAI_API_BASE", "https://api.minimaxi.com/v1"),
+        ),
+        is_gateway=False,
+        is_local=False,
+        detect_by_key_prefix="sk-",
+        detect_by_base_keyword="minimaxi",
+        default_api_base="https://api.minimaxi.com/v1",
+        strip_model_prefix=True,
+        model_overrides=(),
+    ),
     # Groq: mainly used for Whisper voice transcription, also usable for LLM.
     # Needs "groq/" prefix for LiteLLM routing. Placed last — it rarely wins fallback.
     ProviderSpec(
