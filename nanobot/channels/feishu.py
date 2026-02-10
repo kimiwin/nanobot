@@ -1,11 +1,7 @@
-"""Feishu/Lark channel implementation using lark-oapi SDK with WebSocket long connection."""
+"""Feishu (Lark) channel implementation using Long Connection."""
 
 import asyncio
 import json
-import re
-import threading
-from collections import OrderedDict
-from typing import Any
 
 from loguru import logger
 
@@ -14,294 +10,367 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import FeishuConfig
 
-try:
-    import lark_oapi as lark
-    from lark_oapi.api.im.v1 import (
-        CreateMessageRequest,
-        CreateMessageRequestBody,
-        CreateMessageReactionRequest,
-        CreateMessageReactionRequestBody,
-        Emoji,
-        P2ImMessageReceiveV1,
-    )
-    FEISHU_AVAILABLE = True
-except ImportError:
-    FEISHU_AVAILABLE = False
-    lark = None
-    Emoji = None
-
-# Message type display mapping
-MSG_TYPE_MAP = {
-    "image": "[image]",
-    "audio": "[audio]",
-    "file": "[file]",
-    "sticker": "[sticker]",
-}
-
 
 class FeishuChannel(BaseChannel):
     """
-    Feishu/Lark channel using WebSocket long connection.
-    
-    Uses WebSocket to receive events - no public IP or webhook required.
-    
-    Requires:
-    - App ID and App Secret from Feishu Open Platform
-    - Bot capability enabled
-    - Event subscription enabled (im.message.receive_v1)
+    Feishu (Lark) channel implementation using Long Connection.
     """
-    
+
     name = "feishu"
-    
+
     def __init__(self, config: FeishuConfig, bus: MessageBus):
         super().__init__(config, bus)
         self.config: FeishuConfig = config
-        self._client: Any = None
-        self._ws_client: Any = None
-        self._ws_thread: threading.Thread | None = None
-        self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
-        self._loop: asyncio.AbstractEventLoop | None = None
-    
-    async def start(self) -> None:
-        """Start the Feishu bot with WebSocket long connection."""
-        if not FEISHU_AVAILABLE:
-            logger.error("Feishu SDK not installed. Run: pip install lark-oapi")
-            return
-        
-        if not self.config.app_id or not self.config.app_secret:
-            logger.error("Feishu app_id and app_secret not configured")
-            return
-        
-        self._running = True
-        self._loop = asyncio.get_running_loop()
-        
-        # Create Lark client for sending messages
-        self._client = lark.Client.builder() \
-            .app_id(self.config.app_id) \
-            .app_secret(self.config.app_secret) \
-            .log_level(lark.LogLevel.INFO) \
-            .build()
-        
-        # Create event handler (only register message receive, ignore other events)
-        event_handler = lark.EventDispatcherHandler.builder(
-            self.config.encrypt_key or "",
-            self.config.verification_token or "",
-        ).register_p2_im_message_receive_v1(
-            self._on_message_sync
-        ).build()
-        
-        # Create WebSocket client for long connection
-        self._ws_client = lark.ws.Client(
-            self.config.app_id,
-            self.config.app_secret,
-            event_handler=event_handler,
-            log_level=lark.LogLevel.INFO
-        )
-        
-        # Start WebSocket client in a separate thread
-        def run_ws():
-            try:
-                self._ws_client.start()
-            except Exception as e:
-                logger.error(f"Feishu WebSocket error: {e}")
-        
-        self._ws_thread = threading.Thread(target=run_ws, daemon=True)
-        self._ws_thread.start()
-        
-        logger.info("Feishu bot started with WebSocket long connection")
-        logger.info("No public IP required - using WebSocket to receive events")
-        
-        # Keep running until stopped
-        while self._running:
-            await asyncio.sleep(1)
-    
-    async def stop(self) -> None:
-        """Stop the Feishu bot."""
-        self._running = False
-        if self._ws_client:
-            try:
-                self._ws_client.stop()
-            except Exception as e:
-                logger.warning(f"Error stopping WebSocket client: {e}")
-        logger.info("Feishu bot stopped")
-    
-    def _add_reaction_sync(self, message_id: str, emoji_type: str) -> None:
-        """Sync helper for adding reaction (runs in thread pool)."""
+        self._client = None
+        self._api_client = None
+
+    def _download_file(self, message_id: str, file_key: str, resource_type: str, file_name: str | None = None) -> str | None:
+        """Download file from Feishu and return local path."""
         try:
-            request = CreateMessageReactionRequest.builder() \
+            import lark_oapi as lark
+            import os
+            import tempfile
+        except ImportError:
+            return None
+
+        # Ensure download directory exists
+        download_dir = os.path.join(tempfile.gettempdir(), "nanobot_downloads")
+        os.makedirs(download_dir, exist_ok=True)
+        
+        # Use file_key if file_name is not provided
+        if not file_name:
+            file_name = file_key
+            # Append extension if possible, but we might not know it
+            if resource_type == "image":
+                file_name += ".jpg" # Default to jpg for images if unknown
+        
+        file_path = os.path.join(download_dir, file_name)
+        
+        try:
+            request = lark.im.v1.GetMessageResourceRequest.builder() \
                 .message_id(message_id) \
-                .request_body(
-                    CreateMessageReactionRequestBody.builder()
-                    .reaction_type(Emoji.builder().emoji_type(emoji_type).build())
-                    .build()
-                ).build()
-            
-            response = self._client.im.v1.message_reaction.create(request)
+                .file_key(file_key) \
+                .type(resource_type) \
+                .build()
+                
+            response = self._api_client.im.v1.message_resource.get(request)
             
             if not response.success():
-                logger.warning(f"Failed to add reaction: code={response.code}, msg={response.msg}")
-            else:
-                logger.debug(f"Added {emoji_type} reaction to message {message_id}")
+                logger.error(f"Failed to download file: {response.code} {response.msg}")
+                return None
+                
+            with open(file_path, "wb") as f:
+                f.write(response.file.read())
+                
+            logger.info(f"Downloaded file to {file_path}")
+            return file_path
         except Exception as e:
-            logger.warning(f"Error adding reaction: {e}")
-
-    async def _add_reaction(self, message_id: str, emoji_type: str = "THUMBSUP") -> None:
-        """
-        Add a reaction emoji to a message (non-blocking).
-        
-        Common emoji types: THUMBSUP, OK, EYES, DONE, OnIt, HEART
-        """
-        if not self._client or not Emoji:
-            return
-        
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._add_reaction_sync, message_id, emoji_type)
-    
-    # Regex to match markdown tables (header + separator + data rows)
-    _TABLE_RE = re.compile(
-        r"((?:^[ \t]*\|.+\|[ \t]*\n)(?:^[ \t]*\|[-:\s|]+\|[ \t]*\n)(?:^[ \t]*\|.+\|[ \t]*\n?)+)",
-        re.MULTILINE,
-    )
-
-    @staticmethod
-    def _parse_md_table(table_text: str) -> dict | None:
-        """Parse a markdown table into a Feishu table element."""
-        lines = [l.strip() for l in table_text.strip().split("\n") if l.strip()]
-        if len(lines) < 3:
+            logger.error(f"Error downloading file: {e}")
             return None
-        split = lambda l: [c.strip() for c in l.strip("|").split("|")]
-        headers = split(lines[0])
-        rows = [split(l) for l in lines[2:]]
-        columns = [{"tag": "column", "name": f"c{i}", "display_name": h, "width": "auto"}
-                   for i, h in enumerate(headers)]
-        return {
-            "tag": "table",
-            "page_size": len(rows) + 1,
-            "columns": columns,
-            "rows": [{f"c{i}": r[i] if i < len(r) else "" for i in range(len(headers))} for r in rows],
-        }
 
-    def _build_card_elements(self, content: str) -> list[dict]:
-        """Split content into markdown + table elements for Feishu card."""
-        elements, last_end = [], 0
-        for m in self._TABLE_RE.finditer(content):
-            before = content[last_end:m.start()].strip()
-            if before:
-                elements.append({"tag": "markdown", "content": before})
-            elements.append(self._parse_md_table(m.group(1)) or {"tag": "markdown", "content": m.group(1)})
-            last_end = m.end()
-        remaining = content[last_end:].strip()
-        if remaining:
-            elements.append({"tag": "markdown", "content": remaining})
-        return elements or [{"tag": "markdown", "content": content}]
+    def _upload_image(self, file_path: str) -> str | None:
+        """Upload image to Feishu and return image_key."""
+        try:
+            import lark_oapi as lark
+            import os
+        except ImportError:
+            return None
+            
+        if not os.path.exists(file_path):
+            logger.error(f"File not found: {file_path}")
+            return None
+            
+        try:
+            with open(file_path, "rb") as f:
+                request = lark.im.v1.CreateImageRequest.builder() \
+                    .request_body(lark.im.v1.CreateImageRequestBody.builder() \
+                        .image_type("message") \
+                        .image(f) \
+                        .build()) \
+                    .build()
+                    
+                response = self._api_client.im.v1.image.create(request)
+                
+            if not response.success():
+                logger.error(f"Failed to upload image: {response.code} {response.msg}")
+                return None
+                
+            return response.data.image_key
+        except Exception as e:
+            logger.error(f"Error uploading image: {e}")
+            return None
+
+    def _upload_file(self, file_path: str, file_type: str = "stream") -> str | None:
+        """Upload file to Feishu and return file_key."""
+        try:
+            import lark_oapi as lark
+            import os
+        except ImportError:
+            return None
+            
+        if not os.path.exists(file_path):
+            logger.error(f"File not found: {file_path}")
+            return None
+            
+        file_name = os.path.basename(file_path)
+        
+        try:
+            with open(file_path, "rb") as f:
+                request = lark.im.v1.CreateFileRequest.builder() \
+                    .request_body(lark.im.v1.CreateFileRequestBody.builder() \
+                        .file_type(file_type) \
+                        .file_name(file_name) \
+                        .file(f) \
+                        .build()) \
+                    .build()
+                    
+                response = self._api_client.im.v1.file.create(request)
+                
+            if not response.success():
+                logger.error(f"Failed to upload file: {response.code} {response.msg}")
+                return None
+                
+            return response.data.file_key
+        except Exception as e:
+            logger.error(f"Error uploading file: {e}")
+            return None
+
+    async def start(self) -> bool:
+        """Start the Feishu client. Returns True on success."""
+        if not self.config.app_id or not self.config.app_secret:
+            logger.error("Feishu app_id or app_secret not configured")
+            return False
+
+        # Initialize API client for sending messages
+        try:
+            import lark_oapi as lark
+            self._api_client = lark.Client.builder() \
+                .app_id(self.config.app_id) \
+                .app_secret(self.config.app_secret) \
+                .build()
+        except ImportError:
+            logger.error("lark-oapi package not installed. Please run: pip install lark-oapi")
+            return False
+
+        self._running = True
+        main_loop = asyncio.get_running_loop()
+
+        # Run the blocking client in a separate thread
+        def run_client():
+            try:
+                # Create a new event loop for this thread
+                # This MUST happen before importing lark_oapi because lark_oapi.ws.client
+                # captures the current event loop at import time.
+                new_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(new_loop)
+
+                try:
+                    import lark_oapi as lark
+                except ImportError:
+                    logger.error("lark-oapi package not installed. Please run: pip install lark-oapi")
+                    self._running = False
+                    return
+
+                logger.info("Starting Feishu WebSocket client...")
+
+                def do_p2_im_message_receive_v1(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
+                    logger.debug(f"Feishu raw event received: {data}")
+                    msg = data.event.message
+                    content_str = msg.content
+                    
+                    text = ""
+                    media = []
+                    
+                    try:
+                        content_json = json.loads(content_str)
+                        text = content_json.get("text", "")
+                        
+                        # Handle file/image/media
+                        msg_type = msg.message_type
+                        file_key = None
+                        file_name = None
+                        resource_type = None
+                        
+                        if msg_type == "image":
+                            file_key = content_json.get("image_key")
+                            resource_type = "image"
+                        elif msg_type == "file":
+                            file_key = content_json.get("file_key")
+                            file_name = content_json.get("file_name")
+                            resource_type = "file"
+                        elif msg_type == "media": 
+                            file_key = content_json.get("file_key")
+                            file_name = content_json.get("file_name")
+                            resource_type = "media"
+                        elif msg_type == "audio":
+                            file_key = content_json.get("file_key")
+                            resource_type = "file"
+                            
+                        if file_key and resource_type:
+                            file_path = self._download_file(msg.message_id, file_key, resource_type, file_name)
+                            if file_path:
+                                media.append(file_path)
+                                if not text:
+                                    text = f"[{msg_type}] {file_name or 'file'}"
+                                    
+                    except Exception as e:
+                        logger.error(f"Error parsing Feishu message content: {e}")
+                        text = content_str
+
+                    # Remove bot mention if any
+                    if "@_all" in text:
+                        text = text.replace("@_all", "").strip()
+
+                    sender_id = data.event.sender.sender_id.open_id
+                    chat_id = msg.chat_id
+
+                    logger.info(f"Received Feishu message from {sender_id} in {chat_id}: {text[:50]}...")
+
+                    if self.is_allowed(sender_id):
+                        metadata = {
+                            "message_id": msg.message_id,
+                            "chat_id": chat_id,
+                            "msg_type": msg.message_type,
+                            "sender_id": sender_id
+                        }
+
+                        # Use main_loop to schedule the coroutine in the main thread
+                        asyncio.run_coroutine_threadsafe(
+                            self._handle_message(
+                                sender_id=sender_id,
+                                chat_id=chat_id,
+                                content=text,
+                                metadata=metadata,
+                                media=media
+                            ),
+                            main_loop
+                        )
+                    else:
+                        logger.warning(f"Unauthorized Feishu user: {sender_id}")
+
+                event_handler = (
+                    lark.EventDispatcherHandler.builder("", "")
+                    .register_p2_im_message_receive_v1(do_p2_im_message_receive_v1)
+                    .build()
+                )
+
+                # Initialize client inside the thread
+                # CRITICAL FIX: lark-oapi.ws.client module captures the event loop at import time.
+                # If it was imported in the main thread (which happens in start() for api_client),
+                # it holds the main loop. We must monkey-patch it to use our thread's loop.
+                import lark_oapi.ws.client
+                lark_oapi.ws.client.loop = new_loop
+                
+                self._client = lark.ws.Client(
+                    self.config.app_id,
+                    self.config.app_secret,
+                    event_handler=event_handler,
+                    log_level=lark.LogLevel.INFO
+                )
+                self._client.start()
+            except Exception as e:
+                if self._running:
+                    logger.error(f"Feishu client error: {e}")
+                self._running = False
+
+        import threading
+        self._thread = threading.Thread(target=run_client, daemon=True)
+        self._thread.start()
+
+        return True
+
+    async def stop(self) -> None:
+        """Stop the Feishu client."""
+        self._running = False
+        # lark-oapi ws Client doesn't seem to have an explicit stop() in the sample,
+        # but usually these clients have a way to close.
+        # If not, the daemon thread will exit when the main process exits.
+        logger.info("Feishu channel stopping...")
 
     async def send(self, msg: OutboundMessage) -> None:
-        """Send a message through Feishu."""
-        if not self._client:
-            logger.warning("Feishu client not initialized")
+        """Send a message to Feishu."""
+        if not self._api_client:
+            logger.warning("Feishu API client not initialized, cannot send message")
             return
+
+        try:
+            import lark_oapi as lark
+        except ImportError:
+            return
+
+        # Use chat_id from metadata or from the message itself
+        receive_id = msg.chat_id
         
-        try:
-            # Determine receive_id_type based on chat_id format
-            # open_id starts with "ou_", chat_id starts with "oc_"
-            if msg.chat_id.startswith("oc_"):
-                receive_id_type = "chat_id"
-            else:
-                receive_id_type = "open_id"
-            
-            # Build card with markdown + table support
-            elements = self._build_card_elements(msg.content)
-            card = {
-                "config": {"wide_screen_mode": True},
-                "elements": elements,
-            }
-            content = json.dumps(card, ensure_ascii=False)
-            
-            request = CreateMessageRequest.builder() \
-                .receive_id_type(receive_id_type) \
-                .request_body(
-                    CreateMessageRequestBody.builder()
-                    .receive_id(msg.chat_id)
-                    .msg_type("interactive")
-                    .content(content)
+        # Send text if present
+        if msg.content:
+            content = json.dumps({"text": msg.content})
+
+            def _send_sync():
+                request = lark.im.v1.CreateMessageRequest.builder() \
+                    .receive_id_type("chat_id") \
+                    .request_body(lark.im.v1.CreateMessageRequestBody.builder() \
+                        .receive_id(receive_id) \
+                        .msg_type("text") \
+                        .content(content) \
+                        .build()) \
                     .build()
-                ).build()
-            
-            response = self._client.im.v1.message.create(request)
-            
-            if not response.success():
-                logger.error(
-                    f"Failed to send Feishu message: code={response.code}, "
-                    f"msg={response.msg}, log_id={response.get_log_id()}"
-                )
-            else:
-                logger.debug(f"Feishu message sent to {msg.chat_id}")
+                return self._api_client.im.v1.message.create(request)
+
+            # Run blocking network call in executor
+            loop = asyncio.get_running_loop()
+            try:
+                response = await loop.run_in_executor(None, _send_sync)
                 
-        except Exception as e:
-            logger.error(f"Error sending Feishu message: {e}")
-    
-    def _on_message_sync(self, data: "P2ImMessageReceiveV1") -> None:
-        """
-        Sync handler for incoming messages (called from WebSocket thread).
-        Schedules async handling in the main event loop.
-        """
-        if self._loop and self._loop.is_running():
-            asyncio.run_coroutine_threadsafe(self._on_message(data), self._loop)
-    
-    async def _on_message(self, data: "P2ImMessageReceiveV1") -> None:
-        """Handle incoming message from Feishu."""
-        try:
-            event = data.event
-            message = event.message
-            sender = event.sender
-            
-            # Deduplication check
-            message_id = message.message_id
-            if message_id in self._processed_message_ids:
-                return
-            self._processed_message_ids[message_id] = None
-            
-            # Trim cache: keep most recent 500 when exceeds 1000
-            while len(self._processed_message_ids) > 1000:
-                self._processed_message_ids.popitem(last=False)
-            
-            # Skip bot messages
-            sender_type = sender.sender_type
-            if sender_type == "bot":
-                return
-            
-            sender_id = sender.sender_id.open_id if sender.sender_id else "unknown"
-            chat_id = message.chat_id
-            chat_type = message.chat_type  # "p2p" or "group"
-            msg_type = message.message_type
-            
-            # Add reaction to indicate "seen"
-            await self._add_reaction(message_id, "THUMBSUP")
-            
-            # Parse message content
-            if msg_type == "text":
+                if not response.success():
+                    logger.error(f"Failed to send Feishu message: {response.code} {response.msg}")
+                else:
+                    logger.debug(f"Feishu message sent to {receive_id}")
+            except Exception as e:
+                logger.error(f"Error sending Feishu message: {e}")
+
+        # Send media if present
+        if msg.media:
+            for file_path in msg.media:
                 try:
-                    content = json.loads(message.content).get("text", "")
-                except json.JSONDecodeError:
-                    content = message.content or ""
-            else:
-                content = MSG_TYPE_MAP.get(msg_type, f"[{msg_type}]")
-            
-            if not content:
-                return
-            
-            # Forward to message bus
-            reply_to = chat_id if chat_type == "group" else sender_id
-            await self._handle_message(
-                sender_id=sender_id,
-                chat_id=reply_to,
-                content=content,
-                metadata={
-                    "message_id": message_id,
-                    "chat_type": chat_type,
-                    "msg_type": msg_type,
-                }
-            )
-            
-        except Exception as e:
-            logger.error(f"Error processing Feishu message: {e}")
+                    # Determine msg_type based on extension
+                    ext = file_path.lower().split('.')[-1] if '.' in file_path else ""
+                    msg_type = "image" if ext in ["jpg", "jpeg", "png", "gif"] else "file"
+                    
+                    content_dict = {}
+                    
+                    if msg_type == "image":
+                        image_key = await asyncio.to_thread(self._upload_image, file_path)
+                        if not image_key:
+                            logger.error(f"Failed to upload image for sending: {file_path}")
+                            continue
+                        content_dict["image_key"] = image_key
+                    else:
+                        file_key = await asyncio.to_thread(self._upload_file, file_path)
+                        if not file_key:
+                            logger.error(f"Failed to upload file for sending: {file_path}")
+                            continue
+                        content_dict["file_key"] = file_key
+                        
+                    content_json = json.dumps(content_dict)
+                    
+                    def _send_file_sync(m_type=msg_type, c_json=content_json):
+                         request = lark.im.v1.CreateMessageRequest.builder() \
+                            .receive_id_type("chat_id") \
+                            .request_body(lark.im.v1.CreateMessageRequestBody.builder() \
+                                .receive_id(receive_id) \
+                                .msg_type(m_type) \
+                                .content(c_json) \
+                                .build()) \
+                            .build()
+                         return self._api_client.im.v1.message.create(request)
+
+                    loop = asyncio.get_running_loop()
+                    response = await loop.run_in_executor(None, _send_file_sync)
+                    
+                    if not response.success():
+                        logger.error(f"Failed to send Feishu file message: {response.code} {response.msg}")
+                    else:
+                        logger.debug(f"Feishu file message sent to {receive_id}")
+                        
+                except Exception as e:
+                     logger.error(f"Error sending Feishu file: {e}")

@@ -51,7 +51,6 @@ class ProviderSpec:
     # per-model param overrides, e.g. (("kimi-k2.5", {"temperature": 1.0}),)
     model_overrides: tuple[tuple[str, dict[str, Any]], ...] = ()
 
-    @property
     def label(self) -> str:
         return self.display_name or self.name.title()
 
@@ -265,26 +264,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
     # === Auxiliary (not a primary LLM provider) ============================
 
 
-    # MiniMax: OpenAI-compatible endpoint
-    ProviderSpec(
-        name="minimax",
-        keywords=("minimax",),
-        env_key="OPENAI_API_KEY",
-        display_name="MiniMax",
-        litellm_prefix="openai",        # LiteLLM uses openai/ prefix for compatible endpoints
-        skip_prefixes=("openai/",),
-        env_extras=(
-            ("OPENAI_API_BASE", "https://api.minimaxi.com/v1"),
-        ),
-        is_gateway=False,
-        is_local=False,
-        detect_by_key_prefix="sk-",      # Standard API key prefix
-        detect_by_base_keyword="minimaxi",
-        default_api_base="https://api.minimaxi.com/v1",
-        strip_model_prefix=True,          # Strip "openai/" before sending to endpoint
-        model_overrides=(),
-    ),
-    # MiniMax: OpenAI-compatible endpoint
+    # MiniMax: OpenAI-compatible endpoint with OAuth support
     ProviderSpec(
         name="minimax",
         keywords=("minimax",),
@@ -300,10 +280,9 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_key_prefix="sk-",
         detect_by_base_keyword="minimaxi",
         default_api_base="https://api.minimaxi.com/v1",
-        strip_model_prefix=True,
+        strip_model_prefix=False,         # Keep "openai/" prefix for MiniMax
         model_overrides=(),
     ),
-    # Groq: mainly used for Whisper voice transcription, also usable for LLM.
     # Needs "groq/" prefix for LiteLLM routing. Placed last — it rarely wins fallback.
     ProviderSpec(
         name="groq",

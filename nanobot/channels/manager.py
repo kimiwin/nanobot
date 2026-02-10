@@ -77,11 +77,19 @@ class ChannelManager:
         # Feishu channel
         if self.config.channels.feishu.enabled:
             try:
-                from nanobot.channels.feishu import FeishuChannel
-                self.channels["feishu"] = FeishuChannel(
-                    self.config.channels.feishu, self.bus
-                )
-                logger.info("Feishu channel enabled")
+                mode = getattr(self.config.channels.feishu, 'mode', 'websocket')
+                if mode == 'polling':
+                    from nanobot.channels.feishu_polling import FeishuPollingChannel
+                    self.channels["feishu"] = FeishuPollingChannel(
+                        self.config.channels.feishu, self.bus
+                    )
+                    logger.info("Feishu channel enabled (polling mode)")
+                else:
+                    from nanobot.channels.feishu import FeishuChannel
+                    self.channels["feishu"] = FeishuChannel(
+                        self.config.channels.feishu, self.bus
+                    )
+                    logger.info("Feishu channel enabled (websocket mode)")
             except ImportError as e:
                 logger.warning(f"Feishu channel not available: {e}")
 
